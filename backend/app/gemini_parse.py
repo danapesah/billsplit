@@ -5,14 +5,17 @@ Environment (server-side only; never expose keys to clients):
 - BILLSPLIT_GEMINI_API_KEY: Google AI Studio API key for local/dev. If unset, the key is loaded
   from AWS Secrets Manager (``BillSplit-gemini-api-key`` in ``eu-north-1``; requires boto3 and IAM
   secretsmanager:GetSecretValue).
-- GEMINI_MODEL: Model id (default: gemini-2.0-flash).
+- GEMINI_MODEL: Model id (default: gemini-2.5-pro).
+- GEMINI_FALLBACK_MODELS: Comma-separated fallback model ids (default: gemini-2.5-flash).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import random
 import re
+import time
 import uuid
 from typing import Literal
 
@@ -24,7 +27,13 @@ from .models import LineItem, ParseResponse
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_FALLBACK_MODELS = "gemini-2.5-pro"
 MAX_ITEMS = 50
+MAX_RETRIES = 5
+INITIAL_RETRY_DELAY_SECONDS = 1.0
+MAX_OUTPUT_TOKENS = 8192
+JITTER_RATIO = 0.2
+MAX_LOGGED_RESPONSE_CHARS = 4000
 
 
 class GeminiAPIError(Exception):
@@ -137,6 +146,55 @@ def _map_exception_to_status(exc: BaseException) -> int:
     return 503
 
 
+def _is_retryable_exception(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "503",
+            "unavailable",
+            "resource exhausted",
+            "quota",
+            "429",
+            "timeout",
+            "temporarily",
+        )
+    )
+
+
+def _candidate_models() -> list[str]:
+    primary = (os.getenv("GEMINI_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
+    fallback_raw = os.getenv("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS)
+    fallbacks = [m.strip() for m in fallback_raw.split(",") if m.strip()]
+    models: list[str] = []
+    for name in [primary, *fallbacks]:
+        if name and name not in models:
+            models.append(name)
+    return models
+
+
+def _is_model_unavailable_exception(exc: BaseException) -> bool:
+    """Detect model-not-available errors to provide actionable guidance."""
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "model not found",
+            "model is not found",
+            "models are unavailable",
+            "unsupported model",
+            "not available in your region",
+        )
+    )
+
+
+def _truncate_for_log(text: str, limit: int = MAX_LOGGED_RESPONSE_CHARS) -> str:
+    """Keep logs readable while still showing model output for debugging."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated {len(text) - limit} chars]"
+
+
 _PROMPT = """You are parsing a restaurant or retail receipt image. Receipts may be in English, Hebrew, mixed Hebrew/English, or RTL layout — treat all of these equally.
 
 Return ONE JSON object (no markdown) with this shape:
@@ -199,7 +257,7 @@ def parse_bill_with_gemini(image_bytes: bytes, mime_type: str) -> ParseResponse:
             status_code=503,
         )
 
-    model_name = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    model_names = _candidate_models()
     mt = (mime_type or "image/jpeg").split(";")[0].strip().lower()
     if mt == "image/jpg":
         mt = "image/jpeg"
@@ -209,18 +267,64 @@ def parse_bill_with_gemini(image_bytes: bytes, mime_type: str) -> ParseResponse:
 
     client = genai.Client(api_key=api_key)
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[_PROMPT, types.Part.from_bytes(data=image_bytes, mime_type=mt)],
-            config=types.GenerateContentConfig(max_output_tokens=8192),
-        )
-    except Exception as exc:
-        logger.warning("Gemini request failed: %s", type(exc).__name__)
+    response = None
+    last_exc: Exception | None = None
+    for model_name in model_names:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[_PROMPT, types.Part.from_bytes(data=image_bytes, mime_type=mt)],
+                    config=types.GenerateContentConfig(max_output_tokens=MAX_OUTPUT_TOKENS),
+                )
+                if attempt > 1 or model_name != model_names[0]:
+                    logger.info(
+                        "Gemini request recovered on model=%s attempt=%d",
+                        model_name,
+                        attempt,
+                    )
+                break
+            except Exception as exc:
+                last_exc = exc
+                retryable = _is_retryable_exception(exc)
+                if attempt < MAX_RETRIES and retryable:
+                    base_delay = INITIAL_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                    jitter = base_delay * JITTER_RATIO * random.random()
+                    delay = base_delay + jitter
+                    logger.warning(
+                        "Gemini request failed (model=%s attempt=%d/%d, retrying in %.1fs): %s: %s",
+                        model_name,
+                        attempt,
+                        MAX_RETRIES,
+                        delay,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning(
+                    "Gemini request failed (model=%s attempt=%d/%d): %s: %s",
+                    model_name,
+                    attempt,
+                    MAX_RETRIES,
+                    type(exc).__name__,
+                    exc,
+                )
+                break
+        if response is not None:
+            break
+
+    if response is None:
+        assert last_exc is not None
+        if _is_model_unavailable_exception(last_exc):
+            raise GeminiAPIError(
+                "Configured Gemini models are unavailable. Try setting GEMINI_MODEL/GEMINI_FALLBACK_MODELS to region-available models (for example: gemini-2.0-flash or gemini-1.5-flash).",
+                status_code=503,
+            ) from last_exc
         raise GeminiAPIError(
             "Bill parsing service temporarily unavailable.",
-            status_code=_map_exception_to_status(exc),
-        ) from exc
+            status_code=_map_exception_to_status(last_exc),
+        ) from last_exc
 
     if not getattr(response, "candidates", None):
         logger.warning("Gemini returned no candidates (blocked or empty)")
@@ -238,10 +342,16 @@ def parse_bill_with_gemini(image_bytes: bytes, mime_type: str) -> ParseResponse:
     if not text:
         raise GeminiAPIError("Empty response from bill parser.", status_code=502)
 
+    logger.info("Gemini raw response text: %s", _truncate_for_log(text))
+
     try:
         items, receipt_total = _parse_items_json(text)
     except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("Gemini JSON parse failed: %s", type(exc).__name__)
+        logger.warning(
+            "Gemini JSON parse failed: %s; raw response: %s",
+            type(exc).__name__,
+            _truncate_for_log(text),
+        )
         raise GeminiAPIError("Could not parse bill parser output.", status_code=502) from exc
 
     if not items:

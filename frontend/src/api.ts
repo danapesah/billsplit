@@ -1,6 +1,8 @@
 import type { CalculateResponse, LineItem, ParseResponse, Person } from './types'
 
-const base = () => import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
+/** Same origin in production (Docker/EC2); dev default unless `VITE_API_URL` is set. */
+const base = () =>
+  import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '')
 
 export async function parseBillImage(file: File): Promise<ParseResponse> {
   const fd = new FormData()

@@ -1,4 +1,4 @@
-"""Resolve the Gemini API key from env or AWS Secrets Manager."""
+"""Resolve the Gemini API key from AWS Secrets Manager."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 # https://aws.amazon.com/developer/language/python/
 SECRET_NAME = "BillSplit-gemini-api-key"
-REGION_NAME = "eu-north-1"
+REGION_NAME = "us-east-1"
 
 _cached_secret_name: str | None = None
 _cached_key: str | None = None
@@ -39,7 +39,7 @@ def _parse_secret_string(secret_string: str) -> str:
             data = json.loads(s)
             if isinstance(data, dict):
                 for k in (
-                    "BILLSPLIT_GEMINI_API_KEY",
+                    "BillSplit-gemini-api-key",
                     "GEMINI_API_KEY",
                     "API_KEY",
                     "api_key",
@@ -60,7 +60,7 @@ def get_secret() -> str:
     except ImportError as e:
         raise RuntimeError(
             "boto3 is required to load the Gemini API key from AWS Secrets Manager. "
-            "Install boto3 or set BILLSPLIT_GEMINI_API_KEY directly.",
+            "Install boto3.",
         ) from e
 
     secret_name = SECRET_NAME
@@ -86,17 +86,16 @@ def get_secret() -> str:
 
 
 def resolve_gemini_api_key() -> str:
-    """Return the Gemini API key.
-
-    1. ``BILLSPLIT_GEMINI_API_KEY`` — local/dev.
-    2. Otherwise AWS Secrets Manager in ``eu-north-1``, secret ``BillSplit-gemini-api-key``.
-    """
+    """Return the Gemini API key from env var, then AWS Secrets Manager."""
     global _cached_secret_name, _cached_key
 
-    direct = os.getenv("BILLSPLIT_GEMINI_API_KEY", "").strip()
-    if direct:
-        _log_key_present("BILLSPLIT_GEMINI_API_KEY", direct)
-        return direct
+    # Local/dev first: loaded from backend/.env by app.main via python-dotenv.
+    env_key = (os.getenv("BILLSPLIT_GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    if env_key:
+        _cached_key = env_key
+        _cached_secret_name = "__env__"
+        _log_key_present("environment variable", env_key)
+        return env_key
 
     if _cached_key is not None and _cached_secret_name == SECRET_NAME:
         _log_key_present("cache", _cached_key)

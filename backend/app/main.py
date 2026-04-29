@@ -16,6 +16,7 @@ if not _app_log.handlers:
     _app_log.addHandler(_h)
 _app_log.propagate = False
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,3 +68,12 @@ def split_calculate(body: CalculateRequest):
         return CalculateResponse(per_person=per_person, totals=totals)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+_spa_static = Path(__file__).resolve().parent.parent / "static"
+if _spa_static.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=str(_spa_static), html=True),
+        name="spa",
+    )
